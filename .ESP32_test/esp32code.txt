@@ -1,0 +1,67 @@
+#include <Arduino.h>
+
+extern "C" {
+#include "driver/spi_slave.h"
+#include "esp_log.h"
+}
+
+static const char *TAG = "spi_slave";
+
+// === 按 ESP32-S3 SPI2 的 IO_MUX 引脚来配置 ===
+#define PIN_MISO 13   // SPI2 MISO
+#define PIN_MOSI 11   // SPI2 MOSI
+#define PIN_SCLK 12   // SPI2 SCLK
+#define PIN_CS   10   // SPI2 CS0
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("ESP32-S3 SPI Slave start");
+
+  spi_bus_config_t buscfg = {};
+  buscfg.mosi_io_num = PIN_MOSI;
+  buscfg.miso_io_num = PIN_MISO;
+  buscfg.sclk_io_num = PIN_SCLK;
+  buscfg.quadwp_io_num = -1;
+  buscfg.quadhd_io_num = -1;
+  buscfg.max_transfer_sz = 32;
+
+  spi_slave_interface_config_t slvcfg = {};
+  slvcfg.spics_io_num = PIN_CS;
+  slvcfg.flags = 0;
+  slvcfg.queue_size = 1;
+  slvcfg.mode = 0; // 模式 0，对上 nRF5340
+  slvcfg.post_setup_cb = nullptr;
+  slvcfg.post_trans_cb = nullptr;
+
+  // 注意：这里一定是 SPI2_HOST，和上面那组 IO_MUX 一一对应
+  esp_err_t ret = spi_slave_initialize(SPI2_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
+  if (ret != ESP_OK) {
+    Serial.printf("spi_slave_initialize failed: %d\r\n", ret);
+    while (true) { delay(1000); }
+  }
+
+  Serial.println("SPI slave initialized");
+}
+
+void loop() {
+  uint8_t rx_buf[4] = {0};
+  uint8_t tx_buf[4] = {0x10, 0x20, 0x30, 0x50};  // 回给 nRF 的数据
+
+  spi_slave_transaction_t t = {};
+  t.length    = sizeof(rx_buf) * 8;  // 位数
+  t.rx_buffer = rx_buf;
+  t.tx_buffer = tx_buf;
+
+  // 最多等 1000ms，看主机有没有来一次传输
+  esp_err_t ret = spi_slave_transmit(SPI2_HOST, &t, pdMS_TO_TICKS(1000));
+
+  if (ret == ESP_OK) {
+    Serial.printf("RX from nRF: %02X %02X %02X %02X\r\n",
+                  rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
+  } else if (ret == ESP_ERR_TIMEOUT) {
+    Serial.println("wait SPI timeout...");
+  } else {
+    Serial.printf("spi_slave_transmit error: %d\r\n", ret);
+  }
+}
