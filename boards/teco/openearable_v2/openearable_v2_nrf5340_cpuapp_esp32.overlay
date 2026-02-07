@@ -1,0 +1,7 @@
+/* boards/teco/openearable_v2/openearable_v2_nrf5340_cpuapp_esp32.overlay */
+&spi4 {
+    /delete-node/ sdhc@0;
+};
+&load_switch_sd {
+    default-on;
+};

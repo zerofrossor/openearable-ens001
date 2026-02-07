@@ -1,0 +1,16 @@
+# build
+/build*/
+/cmake-build-debug/**
+
+# IntelliJ
+/.idea/**
+
+# VS Code
+/.vscode/**
+
+# MacOS Finder settings
+**/.DS_Store
+
+# Flash Backup files
+/tools/flash/settings_backup.hex
+/tools/flash/uicr_backup.hex

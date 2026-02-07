@@ -1,0 +1,28 @@
+//#pragma once
+
+#ifndef DEVICE_INFO_H
+#define DEVICE_INFO_H
+
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
+
+#define BT_UUID_DEVICE_INFO_VAL \
+	BT_UUID_128_ENCODE(0x45622510, 0x6468, 0x465a, 0xb141, 0x0b9b0f96b468)
+
+/** @brief LED Characteristic UUID. */
+#define BT_UUID_IDENT_VAL \
+    BT_UUID_128_ENCODE(0x45622511, 0x6468, 0x465a, 0xb141, 0x0b9b0f96b468)
+
+#define BT_UUID_GENERATION_VAL \
+    BT_UUID_128_ENCODE(0x45622512, 0x6468, 0x465a, 0xb141, 0x0b9b0f96b468)
+
+#define BT_UUID_FIRMWARE_VAL \
+    BT_UUID_128_ENCODE(0x45622513, 0x6468, 0x465a, 0xb141, 0x0b9b0f96b468)
+
+#define BT_UUID_DEVICE_INFO      BT_UUID_DECLARE_128(BT_UUID_DEVICE_INFO_VAL)
+#define BT_UUID_IDENT            BT_UUID_DECLARE_128(BT_UUID_IDENT_VAL)
+#define BT_UUID_GENERATION       BT_UUID_DECLARE_128(BT_UUID_GENERATION_VAL)
+#define BT_UUID_FIRMWARE         BT_UUID_DECLARE_128(BT_UUID_FIRMWARE_VAL)
+
+#endif
