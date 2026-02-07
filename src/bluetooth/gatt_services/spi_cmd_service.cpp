@@ -43,7 +43,7 @@ static void spi_cmd_work_handler(struct k_work *work)
 		tx[0]=0x22; tx[1]=0x33; tx[2]=0x44; tx[3]=0x55;
 		break;
 	case 3:
-		tx[0]=0x33; tx[1]=0x44; tx[2]=0x55; tx[3]=0x66;
+		tx[0]=0x33; tx[1]=0x44; tx[2]=0x55; tx[3]=0x77;
 		break;
 	default:
 		LOG_WRN("Unknown cmd=%u (ignore)", g_last_cmd);
