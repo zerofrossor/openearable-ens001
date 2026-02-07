@@ -1,309 +1,295 @@
-OpenEarable 2.2.x：复用 SD 卡底座引脚实现 SPI ↔ ESP32 通信（备份说明与使用手册）
-1. 目标与当前阶段成果
-1.1 目标
+OpenEarable (nRF5340) ↔ ESP32 SPI Link via SD-Base Pins
 
-在 不破坏 OpenEarable 现有功能（BLE、传感器、LED、按钮等） 的前提下，复用 OpenEarable 底座 SD/TF 卡接口的引脚与电平转换电路，实现：
+复用 OpenEarable 底座 SD/TF 接口的引脚与供电/电平转换电路，实现稳定 SPI 通信，并支持手机 BLE 写入指令触发 SPI 发送固定 payload。
 
-nRF5340（OpenEarable）作为 SPI 主机
+✅ 项目状态（当前阶段已完成）
 
-ESP32/ESP32-S3 作为 SPI 从机
+ OpenEarable（nRF5340）作为 SPI 主机
 
-通过手机（nRF Connect Mobile 等）写入指令 1 / 2 / 3，触发 nRF5340 通过 SPI 发送三种固定 payload：
+ ESP32 / ESP32-S3 作为 SPI 从机
 
-手机写入（1 byte）	SPI 发送（4 bytes, HEX）
+ 复用 SD 底座引脚（飞线）进行 SPI
+
+ 解决供电域未使能导致的“SPI 不通/全 0/全 FF”问题
+
+ 解决 CS 逻辑反相（GPIO_ACTIVE_LOW）导致的“从机一直未选中”问题
+
+ 新增 BLE GATT 写入特征：手机写入 1/2/3 → 触发 SPI 发送三种 4-byte 指令
+
+ RTT 日志可观察：供电状态、SPI ret、TX/RX 数据
+
+🎯 功能目标
+
+在不破坏 OpenEarable 原有功能（BLE、传感器、LED、按钮等）的前提下，实现：
+
+手机 → BLE 写入 1 byte 指令 → OpenEarable 通过 SPI 发送 4 bytes 命令给 ESP32
+
+手机写入 (1 byte)	SPI TX (4 bytes, HEX)
 0x01	11 22 33 44
 0x02	22 33 44 55
 0x03	33 44 55 66
 
-同时，SPI 返回值/接收数据在 RTT/LOG 中可见，便于调试与验证。
+ESP32 从机可打印接收到的数据；OpenEarable 侧 RTT 可打印 SPI 返回值与回包。
 
-2. 总体架构（你现在做成了什么）
-2.1 数据流（最关键）
+🧠 核心架构（数据流）
+nRF Connect Mobile (Write 0x01/0x02/0x03)
+        ↓
+GATT Write Callback (不做耗时操作)
+        ↓
+k_work_submit()  (异步执行)
+        ↓
+esp32_link_xfer()  (SPI Transceive + 手动 CS)
+        ↓
+SPI wires via SD base pins (with level shifting + power domain)
+        ↓
+ESP32 SPI Slave receives 4 bytes and prints
 
-手机 → BLE GATT Write → nRF5340 写入回调 → k_work 异步执行 → esp32_link_xfer() → SPI 总线 → ESP32 SPI Slave 接收并打印
+🔧 关键经验总结（踩坑记录）
+1) SD 底座引脚不是“裸 IO”，必须使能供电域（LS_SD / V_SD）
 
-2.2 为什么要用 k_work（关键经验）
+最常见问题表现：
 
-BLE 的写入回调在蓝牙栈线程上下文运行，不能在回调里做耗时/可能阻塞的操作（例如 SPI 传输），否则可能导致：
+nRF 侧 ret=0 但 rx=00 00 00 00
 
-BLE 卡顿、断连
+ESP32 侧一直 timeout
 
-系统调度异常
+拔下时读到 FF FF FF FF（MISO 悬空上拉）
 
-数据不稳定
+根因：
+SD/TF 底座信号经过：
 
-因此设计为：
+Load Switch（供电开关）
 
-写入回调只做：校验 + 存命令 + k_work_submit()
+电平转换/缓冲
 
-真正 SPI 传输在 work handler 里执行
+供电域 V_SD
+如果 LS_SD 没打开，外侧 SPI 线路“看起来有电平但实际不可用/不稳定”。
 
-3. 关键硬件点：为什么以前 SPI 不通、后来通了？
-3.1 SD 底座引脚不是“直接裸 IO”
+✅ 最终解决：
+在 esp32_link_init() 内部 强制 esp32_link_set_power(true)，确保：
 
-SD/TF 底座对应的信号线往往经过：
+LS_3V3 打开
 
-电平转换器
+LS_SD 打开（V_SD 供电）
 
-负载开关（Load Switch）
+等待电平稳定（延时 20~50ms）
 
-供电域（V_SD）
+可选：读回并打印状态，防止被其他模块关掉
 
-如果 V_SD 未使能（Load Switch 未打开），外侧线路会出现典型现象：
+2) CS 逻辑反相（GPIO_ACTIVE_LOW）会让从机永远没被选中
 
-主机 SPI 调用 ret=0（驱动层面觉得传完了），但实际从机收不到
+典型表现：
 
-主机读回可能出现全 00 或随机
+SPI 调用不报错，但 ESP32 永远 timeout
 
-从机侧持续 timeout
+或 nRF 侧读回全 0
 
-3.2 最重要的修复：固定使能 SD 域供电（LS_SD）
+根因：
+Devicetree 的 cs-gpios 常配置为 GPIO_ACTIVE_LOW。
+如果你用 gpio_pin_set_dt()（逻辑电平），可能会自动反相，导致你以为拉低 CS，实际上是拉高。
 
-最终稳定工作的做法：
+✅ 最终解决：
+CS 采用 物理电平控制：
 
-在 esp32_link_init() 内部强制调用 esp32_link_set_power(true)
+gpio_pin_set_raw(cs_port, cs_pin, 0) = 物理拉低（选中）
 
-esp32_link_set_power(true) 会：
+gpio_pin_set_raw(cs_port, cs_pin, 1) = 物理拉高（释放）
 
-保持 LS_3V3 打开
+这样行为完全对齐你在 nRF5340 DK 上验证成功的写法。
 
-打开 LS_SD，确保 V_SD 有电
+3) BLE 写入回调里不要直接跑 SPI（必须异步）
 
-延时一小段时间让电平转换稳定
+原因：
+写入回调运行在蓝牙栈上下文中，做 SPI 可能阻塞 → 导致 BLE 不稳定。
 
-（可选）读回引脚状态并打印日志，便于确认没有被其它模块拉低
+✅ 最终解决：
+使用 k_work：
 
-经验总结：
-“SPI 线没电 = 一切都是假的。”
-必须先确认 V_SD = 3.3V（或预期电压）稳定存在。
+回调：只校验/保存命令/submit work
 
-3.3 第二个关键修复：CS 物理电平与 GPIO_ACTIVE_LOW 语义冲突
+work handler：执行 esp32_link_xfer()
 
-OpenEarable devicetree 中的 cs-gpios 常配置为 GPIO_ACTIVE_LOW。
-如果用 gpio_pin_set_dt()，写入的“逻辑值”会被自动反相，导致你以为拉低 CS，实际拉高了（或相反），表现为：
+📁 工程改动清单（必须备份的内容）
 
-ESP32 从机一直认为没有被选中（timeout）
+路径以你当前工程结构为准（你已在工程里实现并验证通过）
 
-nRF 主机读回全 00（MISO 被拉低或未驱动）
+1) SPI 封装模块（主机侧）
 
-最终稳定做法：
-
-CS 使用 raw 物理电平控制：gpio_pin_set_raw()
-
-固定行为：0 = 物理拉低（选中），1 = 物理拉高（释放）
-完全对齐你在 nRF5340 DK 上验证成功的写法。
-
-4. 工程改动清单（必须备份的文件与位置）
-
-以下路径以你当前工程结构为准（你之前报错路径显示 src/spi_esp32/ 与 src/bluetooth/gatt_services/）。
-
-4.1 SPI 主机封装模块
-
-目录： src/spi_esp32/
+目录：src/spi_esp32/
 
 esp32_link.hpp
 
 esp32_link.cpp
 
-功能要点：
+关键功能：
 
-esp32_link_init()：初始化 SPI + CS + 强制打开 LS_SD 供电域
+初始化 SPI + CS
 
-esp32_link_xfer()：全双工传输（建议所有上层都走这个）
+强制使能供电域（LS_SD）
 
-CS 用 gpio_pin_set_raw() 控制物理电平
+SPI transceive
 
-每次传输前可选 esp32_link_set_power(true) 兜底（防止被其他模块误关）
+CS 使用 gpio_pin_set_raw（物理电平）
 
-4.2 BLE 写入触发 SPI 的 GATT 服务（新增）
+2) BLE GATT 服务：写入 1/2/3 触发 SPI
 
-目录： src/bluetooth/gatt_services/
+目录：src/bluetooth/gatt_services/
 
 spi_cmd_service.h
 
-spi_cmd_service.cpp （注意：必须是 .cpp，因为 include 了 C++ 头 esp32_link.hpp）
+spi_cmd_service.cpp ✅（必须是 .cpp，因为 include C++ 头）
 
-功能要点：
+关键功能：
 
-新增自定义 128-bit UUID Service + Characteristic
+自定义 128-bit UUID Service + Characteristic
 
 Characteristic 支持 Write / Write Without Response
 
-写入 1 字节 0x01/0x02/0x03 → 触发 SPI 发送不同 4 字节 payload
+写入 0x01/0x02/0x03 → work handler 内调用 SPI 发送固定 payload
 
-work handler 里调用 esp32_link_init() + esp32_link_xfer()
+RTT/LOG 打印发送与回包
 
-RTT/LOG 输出发送与回包，便于验证
+3) CMakeLists.txt
 
-4.3 CMakeLists.txt 修改
-
-确保把 spi_cmd_service.cpp 加入编译（示例）：
+确保编译进新文件：
 
 target_sources(app PRIVATE
-  src/bluetooth/gatt_services/spi_cmd_service.cpp
   src/spi_esp32/esp32_link.cpp
+  src/bluetooth/gatt_services/spi_cmd_service.cpp
 )
 
 
-注意：如果你用了 GLOB，也要确认 .cpp 确实被包含；否则会出现“手机找不到 service”或 link error。
+注意：若使用 glob 或其他方式，也必须确认 .cpp 被包含，否则手机端看不到 service。
 
-4.4 main 的改动点
+4) main 初始化（仅需 1 行）
 
-main 只需要在初始化阶段调用一次：
+在 main 的初始化阶段调用：
 
-init_spi_cmd_service();
+ret = init_spi_cmd_service();
+ERR_CHK(ret);
 
-建议位置：与 init_led_service()、init_sensor_service() 同级，确保在 BLE 开始工作前完成注册/初始化。
 
-原则：
+✅ 除此之外 不需要改 main 的主流程。
+（推荐：不要长期保留“每秒自动发 SPI”的测试线程，以免和 BLE 指令混淆）
 
-不建议在 main 里永久保留“每秒自动发 SPI”的测试线程（除非你明确需要）。
+🔌 接线与硬件注意事项（飞线必看）
 
-推荐：SPI 由 BLE 指令触发，行为可控且易验证。
+✅ 必须共地：OpenEarable GND ↔ ESP32 GND
+否则可能出现 ret=0 但数据全乱/从机 timeout。
 
-5. 运行与验证（你或别人按这套就能复现）
-5.1 固件端（OpenEarable / nRF5340）
+✅ 确认 V_SD：
 
-build profile：你当前能成功的 build_esp32 配置
+LS_SD 打开时，底座相关引脚应能测到约 3V（你已验证）
 
-烧录：通过 5340DK J-Link（官方推荐方式）
+如果一直 0V，优先检查：LS_SD 是否被拉高 / 是否被其他模块关掉
 
-日志查看：SEGGER RTT（你已验证可用）
+✅ MOSI/MISO/SCK/CS 不要接反
+最常见错误是 MOSI/MISO 对调，表现为：
 
-你应该看到的 RTT/LOG 关键字：
+ESP32 可能收到全 0 或完全收不到
 
-esp32_link_init done...
+nRF 侧读回全 0 或随机
 
-Power ON: LS_SD readback=1 ...
+🧪 运行与验证步骤
+A) OpenEarable（nRF5340）侧
+
+Pristine / Clean build（强烈建议）
+
+烧录（5340DK + J-Link）
+
+打开 RTT（SEGGER RTT Viewer / nRF Connect RTT）
+
+观察日志中是否出现：
+
+Power ON: LS_SD ...
 
 SPI cmd queued: 1
 
-SPI cmd=1 ret=0 tx=11 22 33 44 ...
+SPI cmd=1 ret=0 tx=... rx=...
 
-5.2 手机端（nRF Connect Mobile）
+B) 手机（nRF Connect Mobile）
 
 连接 OpenEarable
 
-找到自定义 SPI CMD Service（UUID 以 7A2B0001-... 开头）
+找到 SPI CMD Service（自定义 UUID）
 
-找到 Characteristic（UUID 7A2B0002-...）
+在 characteristic 里 Write：
 
-Write 值：
+写 01 → 触发 11 22 33 44
 
-01 → 发 11 22 33 44
+写 02 → 触发 22 33 44 55
 
-02 → 发 22 33 44 55
+写 03 → 触发 33 44 55 66
 
-03 → 发 33 44 55 66
+C) ESP32（SPI 从机）
 
-5.3 ESP32 从机侧
+串口应打印收到的 4 字节数据
 
-SPI Slave 初始化成功
+若持续 timeout：
 
-串口日志应出现：
+检查共地
 
-RX from nRF: 11 22 33 44 等
+检查 CS 是否真拉低
 
-如果持续 timeout：优先检查 CS/供电/线序/是否共地
+检查 LS_SD / V_SD 是否确实供电
 
-6. 接线注意事项（必须写清楚，否则以后必踩坑）
+检查线序
 
-因为你是“从 SD 底座引脚飞线”，你无法打开设备，只能从外部测量。
+🧯 常见问题（快速排障）
+1) nRF 侧 ret=0 但 rx=00 00 00 00，ESP32 侧 timeout
 
-6.1 必须共地
+优先排查顺序：
 
-OpenEarable GND 与 ESP32 GND 必须连接，否则可能出现：
+CS 是否物理拉低（是否用了 gpio_pin_set_raw）
 
-ret=0 但读回随机
+LS_SD / V_SD 是否一直上电（是否被其他模块关掉）
 
-ESP32 timeout
+MOSI/MISO 是否接反
 
-波形测量误导
+是否共地
 
-6.2 供电域与电平
+2) 拔下 ESP32 时读到 FF，插上变成 00
 
-SD 底座外侧电压来自 V_SD（由 LS_SD 控制）
+FF：MISO 悬空上拉（正常现象）
 
-你已验证：当 LS_SD=1 时底座引脚电压在 3V 左右并可跳变
+00：MISO 被外侧拉低/钳位，但从机可能没被选中
+重点看：CS 与供电域是否正确
 
-若发现一直 0V：
+3) 编译报错 fatal error: cstddef: No such file or directory
 
-优先确认 LS_SD 是否被拉高
+原因：.c 文件用 C 编译器（-std=c99）编译，不能 include C++ 标准头。
+解决：将 BLE service 改为 .cpp，或提供 C 版桥接头（不推荐）。
 
-确认 LS_3V3 总开关是否打开
+🧾 环境信息（备份必须留存）
 
-确认没有其他模块把它关掉（例如 SD logging 功能）
+NCS：v3.0.1（你日志中可见）
 
-6.3 CS 的“物理电平”原则
+Zephyr：v4.0.99-ncs1-1（你日志中可见）
 
-你的主机逻辑：CS 物理拉低 = 选中
+工具：nRF Connect for VS Code / west / sysbuild
 
-如果用 dt 语义控制（gpio_pin_set_dt）可能会反相
+调试：SEGGER RTT（J-Link）
 
-因此最终实现选择 gpio_pin_set_raw 保证物理一致性
+🚀 后续扩展建议（可选）
 
-7. 常见问题与排障手册（将来你一定会用到）
-Q1：nRF 端 ret=0 但 rx=00 00 00 00，ESP32 端 timeout
+把 1/2/3 扩展为结构化命令（opcode + payload）
 
-最常见原因顺序：
+增加 Notify：把 ESP32 回包通过 BLE notify 发回手机
 
-CS 没真正被拉低（active_low 反相 / 接错脚）
+加队列：支持连续命令排队发送
 
-V_SD 没上电（LS_SD 未使能）
+与按钮/传感器事件联动：例如按键触发 SPI 命令
 
-MISO/MOSI 接反
+📌 维护建议（强烈推荐）
 
-未共地
+复制整个工程目录做快照：openearable_spi_backup_YYYYMMDD/
 
-Q2：拔下 ESP32 时 nRF 读到 FF，插上变成 00
+README 放根目录：README.md
 
-FF：MISO 线上拉/悬空高
+附上：
 
-00：MISO 被外侧拉低或被钳位
-优先排查：供电域、电平转换、MISO 物理连接是否正确
+飞线照片
 
-Q3：为什么 .c 文件 include esp32_link.hpp 会报错 cstddef？
+你最终测到的 V_SD 波形/电压
 
-.c 用 C 编译器（-std=c99），不认识 C++ 标准头
-
-解决：GATT service 文件改为 .cpp 或提供 C 版 API 头
-
-8. 版本与环境信息（备份必须包含）
-
-OpenEarable 工程版本：2.2.x（你当前使用的分支/包）
-
-NCS：v3.0.1（日志中可见）
-
-Zephyr：v4.0.99-ncs1-1（日志中可见）
-
-构建工具：nRF Connect for VS Code + west + sysbuild
-
-调试输出：SEGGER RTT（J-Link V8.xx）
-
-9. 建议的备份方式（可选但强烈推荐）
-
-复制整个工程目录作为快照，例如：
-
-openearable_spi_blecmd_backup_YYYYMMDD/
-
-在根目录放置本文档：
-
-README_SPI_ESP32_BACKUP.md
-
-在文档顶部记录：
-
-接线照片/示意图
-
-你最终使用的 SPI 引脚来源（SD 底座哪几脚）
-
-你最终验证通过的 RTT 输出片段（10 行以内）
-
-10. 下一步可扩展方向（未来你要做时会用到）
-
-把 1/2/3 扩展为结构化命令（例如 opcode + payload）
-
-增加从 ESP32 回包的解析与状态上报（BLE Notify）
-
-把 SPI 命令与 OpenEarable 现有状态机挂钩（如按钮触发、传感器触发）
-
-加互斥与队列（多指令排队发送）
+10 行 RTT “成功通信”日志
