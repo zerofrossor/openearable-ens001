@@ -1,204 +1,309 @@
-# OpenEarable 2 - Firmware
+OpenEarable 2.2.x：复用 SD 卡底座引脚实现 SPI ↔ ESP32 通信（备份说明与使用手册）
+1. 目标与当前阶段成果
+1.1 目标
 
-[OpenEarable](openearable.com) is the world's first fully open-source AI platform for ear-based sensing applications with true wireless audio. Packed with an unprecedented array of high-precision sensors, OpenEarable redefines what's possible in wearable tech. Designed for both development and research applications, OpenEarable is modular, reconfigurable, and built for the future.
-<br/><br/><br/>
-![image](https://github.com/user-attachments/assets/8cb55571-c6bc-4f51-b2ae-628f7be3661c)
+在 不破坏 OpenEarable 现有功能（BLE、传感器、LED、按钮等） 的前提下，复用 OpenEarable 底座 SD/TF 卡接口的引脚与电平转换电路，实现：
 
-## Table of Contents
+nRF5340（OpenEarable）作为 SPI 主机
 
-1. [Setup](#setup)
+ESP32/ESP32-S3 作为 SPI 从机
 
-2. [Battery States](#battery-states)
+通过手机（nRF Connect Mobile 等）写入指令 1 / 2 / 3，触发 nRF5340 通过 SPI 发送三种固定 payload：
 
-3. [Connection States](#connection-states)  
+手机写入（1 byte）	SPI 发送（4 bytes, HEX）
+0x01	11 22 33 44
+0x02	22 33 44 55
+0x03	33 44 55 66
 
-4. [SD Card](#sd-card)
-   
-5. [Citing](#citing)
+同时，SPI 返回值/接收数据在 RTT/LOG 中可见，便于调试与验证。
 
+2. 总体架构（你现在做成了什么）
+2.1 数据流（最关键）
 
-## Setup
-1. **Install Visual Studio Code (VS Code)**  
-   - Download and install from [https://code.visualstudio.com](https://code.visualstudio.com).
+手机 → BLE GATT Write → nRF5340 写入回调 → k_work 异步执行 → esp32_link_xfer() → SPI 总线 → ESP32 SPI Slave 接收并打印
 
-2. **Install the J‑Link Software and Documentation Package**
-   - Download and install from [https://www.segger.com/downloads/jlink/](https://www.segger.com/downloads/jlink/).
-     
-3. **Install nRF-Util**  
-   - Download from [nRF Util – Nordic Semiconductor](https://www.nordicsemi.com/Products/Development-tools/nRF-Util).
-   - Add `nrfutil` to your system's `PATH` environment variable.
+2.2 为什么要用 k_work（关键经验）
 
-4. **Install the nRF Connect for VS Code Extension**  
-   - Open VS Code.
-   - Go to the Extensions tab and install **"nRF Connect for VS Code"**.
-   - Install all required dependencies when prompted.
+BLE 的写入回调在蓝牙栈线程上下文运行，不能在回调里做耗时/可能阻塞的操作（例如 SPI 传输），否则可能导致：
 
-5. **Install the Toolchain via nRF Connect**  
-   - Open the **nRF Connect** tab in VS Code.
-   - Click **"Install Toolchain"**.
-   - Select and install **version 3.0.1**.
+BLE 卡顿、断连
 
-6. **Install the nRF Connect SDK**  
-   - In the **nRF Connect** tab, select **"Manage SDK"**. 
-   - Install **SDK version 3.0.1**.
+系统调度异常
 
-7. **Open the Firmware Folder in VS Code**  
-   - Use `File > Open Folder` or drag-and-drop the firmware directory into VS Code.
-   - OR in the **APPLICATIONS** section of the nRF Connect tab:
-     - Select `Open Exisiting Application`.
-     - Select the `open-earable-2` directory.
+数据不稳定
 
-8. **Configure the Application Build**
-   - If not already open, navigate to the nrfConnect extension tab in VSCode.
-   - In the **APPLICATIONS** section of the nRF Connect extension tab:  
-     - Select the `open-earable-2` application.  
-     - Click **"+ Add build configuration"** to set up a new build.
-     - Select the SDK version 3.0.1, toolchain version 3.0.1, and `open-earable-2/nrf5340/cpuapp` as board target.
-     - To build **with FOTA** (firmware over-the-air update functionality):
-       - Leave the `Base configuration files (Kconfig fragments)` dropdown empty.
-       - as `Extra CMAKE arguments` set `-DFILE_SUFFIX="fota"`.
-       - as `Build directory` name set `build_fota`.
-     -  To build **without FOTA**:
-        - Select `prj.conf` as the `Base configuration files (Kconfig fragments)`.
-        - Do not set any of the FOTA flags described above.
-    
-9. **J-Link Setup**
-   - Wire your J-Link to the debugging breakout PCB as shown below.
-   ![image](https://github.com/user-attachments/assets/2eeec41e-6be1-4a4f-b986-7d9a07b0f8e5)
-   - If you do not own a J-Link yet, here are a few options (do **NOT** use J-Link clones, they will not work and are illegal!):
-      - [J-Link EDU Mini](https://mou.sr/3LrwiVe) (available to educational institutions, private persons, and students) with [JTAG adapter](https://www.adafruit.com/product/2094) and [cable](https://www.adafruit.com/product/1675).
-      - Full-scale J-Link for commercial use (e.g., [J-Link BASE Compact](https://mou.sr/4oQkAls)).
-      - ⚠️ The wiring show in the figure above is for the full-scale J-Link pinout. If you use the [JTAG adapter](https://www.adafruit.com/product/2094) the wiring may be different so make sure it is correct in your case! _(to be confirmed, picture coming soon)_.
+因此设计为：
 
-10. **Build and Flash**
-     - Click on `Generate and Build` and wait for the application to build (this will take some time).
-     - Make sure your device is charged or powered via USB. If the battery is fully discharged, the charging management IC will no longer supply power to the MCU from the battery, so you won’t be able to flash the MCU unless the battery is charged or the device is directly powered via USB.
-     - Open a new terminal in VS Code and run the following command from the root of the `open-earable-v2` directory to flash the FOTA build. Make sure to set the serial number of your J-Link (right click your J-Link in the `CONNECTED DEVICES` tab of the nRF connect extension and copy the serial number).
+写入回调只做：校验 + 存命令 + k_work_submit()
 
-<<<<<<< HEAD
-11. **Build and Flash**
-   - Click on `Generate and Build` and wait for the application to build (this will take some time)
-   - Open a new terminal in VS Code and run the following command from the root of the `open-earable-v2` directory to flash the FOTA build. Make sure to set the serial number of your J-Link (right click your J-Link in the `CONNECTED DEVICES` tab of the nRF connect extension and copy the serial number).
-     ```bash
-     # --right for the right ear device, or no flag to retain left/right bonding, --standalone for no pair
-     # --hw version is optional
-     ./tools/flash/flash_fota.sh --snr 123456789 --left --hw 2.0.1    
-   
-     ```
-   - or without FOTA
-     ```bash
-     # --right for the right ear device, or no flag to retain left/right bonding
-      # --hw version is optional
-     ./tools/flash/flash.sh --snr 123456789 --left --hw 2.0.1      
-     ```
-=======
-      ```bash
-      # --right for the right ear device, or no flag to retain left/right bonding
-      # --standalone for no pair
+真正 SPI 传输在 work handler 里执行
 
-      ./tools/flash/flash_fota.sh --snr 123456789 --left 
-      ```
+3. 关键硬件点：为什么以前 SPI 不通、后来通了？
+3.1 SD 底座引脚不是“直接裸 IO”
 
-     - or without FOTA
+SD/TF 底座对应的信号线往往经过：
 
-      ```bash
-      # --right for the right ear device, or no flag to retain left/right bonding
-      # --standalone for no pair
+电平转换器
 
-      ./tools/flash/flash.sh --snr 123456789 --left    
-      ```
-     - The FOTA update script is also available for Windows as `./tools/flash/flash_fota.ps1`. To execute it, open PowerShell with administrative privileges.
->>>>>>> 2cc8b14 (Update README with debug output instructions)
+负载开关（Load Switch）
 
-11. **Recover Board**
-     - If the application or network core becomes unresponsive, or you encounter flashing issues, you can recover the board using the recovery script. The `--snr` parameter specifies the serial number of your J-Link debugger.
-     - Ensure the device is powered via USB or that the battery is sufficiently charged before running the recovery process. Otherwise, the MCU may not power up correctly and the recovery will fail.
-      ```bash
-      ./tools/flash/recover.sh --snr 123456789
-      ```
-     - After successful recovery, you can attempt to flash the firmware again.
-   
-12. **Enable Debug Output**
-     - Open the **J-Link Configuration** program on your computer.  
-        - On macOS: Press `CMD` + `Space` and search for `J-Link Config`.  
-        - On Windows: Search for the program from the taskbar.  
-     - Ensure your J-Link is connected to your computer.  
-     - In the **Connected via USB** table, locate your J-Link device. Double-click it or right-click and select **Configure**.  
-     - Find the **Virtual COM-Port** option and select **Enable**. Click **OK** to apply the setting.  
-     - Open **Visual Studio Code**.  
-     - In the left sidebar, open the **Extensions** menu.  
-     - Search for and install the [**Serial Monitor**](https://marketplace.visualstudio.com/items?itemName=ms-vscode.vscode-serial-monitor) extension.  
-     - In the top menu bar, click **Terminal → New Terminal**.  
-     - A terminal window will appear at the bottom of VS Code. Open the **Serial Monitor** tab.  
-     - In the **Port** dropdown menu, select your J-Link’s COM port.  
-     - Set the **Baud rate** to **115200**.  
-     - Click **Start Monitoring**.  
-     - Ensure your earable is connected to the debugger probe. You should now see debug output appearing when you interact with the device (e.g., press button).
+供电域（V_SD）
 
+如果 V_SD 未使能（Load Switch 未打开），外侧线路会出现典型现象：
 
+主机 SPI 调用 ret=0（驱动层面觉得传完了），但实际从机收不到
 
-## Battery States
-Battery states will overwrite LED connection states. All LED states can be manually overwritten via BLE service.
+主机读回可能出现全 00 或随机
 
-### Charging States
+从机侧持续 timeout
 
-| LED State         | Description                                                                 |
-|------------------|-----------------------------------------------------------------------------|
-| 🟥 Red - Solid      | Battery fault or deep discharge*, charging current = 0                       |
-| 🔴 Red - Pulsing    | Pre-charge phase or system-down voltage not yet cleared                     |
-| 🟧 Orange - Solid   | Power connected, but charging current is not verified or not at desired level |
-| 🟠 Orange - Pulsing | At least 80% of the target charging current is reached                      |
-| 🟢 Green - Pulsing  | Trickle charge; final voltage (constant voltage) reached. Can be disabled via config |
-| 🟩 Green - Solid    | Fully charged                                                               |
+3.2 最重要的修复：固定使能 SD 域供电（LS_SD）
 
-*If your OpenEarable goes into deep discharge (solid red) after pre-charge (red pulse), you can unplug the OpenEarable and plug it in again. This should recover the device.
+最终稳定工作的做法：
+
+在 esp32_link_init() 内部强制调用 esp32_link_set_power(true)
+
+esp32_link_set_power(true) 会：
+
+保持 LS_3V3 打开
+
+打开 LS_SD，确保 V_SD 有电
+
+延时一小段时间让电平转换稳定
+
+（可选）读回引脚状态并打印日志，便于确认没有被其它模块拉低
+
+经验总结：
+“SPI 线没电 = 一切都是假的。”
+必须先确认 V_SD = 3.3V（或预期电压）稳定存在。
+
+3.3 第二个关键修复：CS 物理电平与 GPIO_ACTIVE_LOW 语义冲突
+
+OpenEarable devicetree 中的 cs-gpios 常配置为 GPIO_ACTIVE_LOW。
+如果用 gpio_pin_set_dt()，写入的“逻辑值”会被自动反相，导致你以为拉低 CS，实际拉高了（或相反），表现为：
+
+ESP32 从机一直认为没有被选中（timeout）
+
+nRF 主机读回全 00（MISO 被拉低或未驱动）
+
+最终稳定做法：
+
+CS 使用 raw 物理电平控制：gpio_pin_set_raw()
+
+固定行为：0 = 物理拉低（选中），1 = 物理拉高（释放）
+完全对齐你在 nRF5340 DK 上验证成功的写法。
+
+4. 工程改动清单（必须备份的文件与位置）
+
+以下路径以你当前工程结构为准（你之前报错路径显示 src/spi_esp32/ 与 src/bluetooth/gatt_services/）。
+
+4.1 SPI 主机封装模块
+
+目录： src/spi_esp32/
+
+esp32_link.hpp
+
+esp32_link.cpp
+
+功能要点：
+
+esp32_link_init()：初始化 SPI + CS + 强制打开 LS_SD 供电域
+
+esp32_link_xfer()：全双工传输（建议所有上层都走这个）
+
+CS 用 gpio_pin_set_raw() 控制物理电平
+
+每次传输前可选 esp32_link_set_power(true) 兜底（防止被其他模块误关）
+
+4.2 BLE 写入触发 SPI 的 GATT 服务（新增）
+
+目录： src/bluetooth/gatt_services/
+
+spi_cmd_service.h
+
+spi_cmd_service.cpp （注意：必须是 .cpp，因为 include 了 C++ 头 esp32_link.hpp）
+
+功能要点：
+
+新增自定义 128-bit UUID Service + Characteristic
+
+Characteristic 支持 Write / Write Without Response
+
+写入 1 字节 0x01/0x02/0x03 → 触发 SPI 发送不同 4 字节 payload
+
+work handler 里调用 esp32_link_init() + esp32_link_xfer()
+
+RTT/LOG 输出发送与回包，便于验证
+
+4.3 CMakeLists.txt 修改
+
+确保把 spi_cmd_service.cpp 加入编译（示例）：
+
+target_sources(app PRIVATE
+  src/bluetooth/gatt_services/spi_cmd_service.cpp
+  src/spi_esp32/esp32_link.cpp
+)
 
 
-### Discharging States
+注意：如果你用了 GLOB，也要确认 .cpp 确实被包含；否则会出现“手机找不到 service”或 link error。
 
-| LED State           | Description                                                              |
-|--------------------|--------------------------------------------------------------------------|
-| 🟠 Orange - Blinking | Battery low (7% remaining or EDV2 reached). Disabled by default, enable via config |
-| 🔴 Red - Blinking      | Battery critical (3% remaining or EDV1 reached)                          |
+4.4 main 的改动点
 
+main 只需要在初始化阶段调用一次：
 
-## Connection States
-Battery states will overwrite LED connection states. All LED states can be manually overwritten via BLE service.
+init_spi_cmd_service();
 
-| LED State                           | Description                                                                 |
-|-------------------------------------|-----------------------------------------------------------------------------|
-| 🔵 Blue – Blinking Very Fast        | Configured as **left device**, searching for **right device**               |
-| 🔴 Red – Blinking Very Fast         | Configured as **right device**, searching for **left device**               |
-| 🔵 Blue – Blinking Fast             | Paired with left/right, **ready for device bonding**                        |
-| 🔵 Blue – Blinking Slow             | Bonded, **waiting for connection**                                          |
-| 🟢 Green – Blinking Slow            | **Connected**                                                               |
-| 🟣 Purple – Blinking Slow           | **SD card recording**                                                       |
+建议位置：与 init_led_service()、init_sensor_service() 同级，确保在 BLE 开始工作前完成注册/初始化。
 
-## SD Card
-Because ZephyrOS does not allow remounting of SD cards, it is **very important that the device is turned of before inserting or removing the SD card**.
-As long as a recording to the SD card is active, the LED light will blink purple.
+原则：
 
+不建议在 main 里永久保留“每秒自动发 SPI”的测试线程（除非你明确需要）。
 
-### File Parsing
-Files recorded to the local microSD card in the binary `*.oe` format can be parsed using <a href="https://colab.research.google.com/drive/1qwdvjAM5Y5pLbNW5t3r9f0ITpAuxBKeq" target="_blank">this Python notebook</a>.
+推荐：SPI 由 BLE 指令触发，行为可控且易验证。
 
-## Citing
-If you are using OpenEarable, please cite is as follows:
-```
-@article{roddiger2025openearable,
-     title = {OpenEarable 2.0: Open-Source Earphone Platform for Physiological Ear Sensing},
-     author = {Röddiger, Tobias and Küttner, Michael and Lepold, Philipp and King, Tobias and Moschina, Dennis and Bagge, Oliver and Paradiso, Joseph A. and Clarke, Christopher and Beigl, Michael},
-     year = 2025,
-     journal = {Proceedings of the ACM on Interactive, Mobile, Wearable and Ubiquitous Technologies},
-     volume = {9},
-     number = {1},
-     pages = {1--33},
-     publisher={ACM New York, NY, USA}
-}
-```
+5. 运行与验证（你或别人按这套就能复现）
+5.1 固件端（OpenEarable / nRF5340）
 
+build profile：你当前能成功的 build_esp32 配置
 
+烧录：通过 5340DK J-Link（官方推荐方式）
 
+日志查看：SEGGER RTT（你已验证可用）
 
+你应该看到的 RTT/LOG 关键字：
 
+esp32_link_init done...
 
+Power ON: LS_SD readback=1 ...
+
+SPI cmd queued: 1
+
+SPI cmd=1 ret=0 tx=11 22 33 44 ...
+
+5.2 手机端（nRF Connect Mobile）
+
+连接 OpenEarable
+
+找到自定义 SPI CMD Service（UUID 以 7A2B0001-... 开头）
+
+找到 Characteristic（UUID 7A2B0002-...）
+
+Write 值：
+
+01 → 发 11 22 33 44
+
+02 → 发 22 33 44 55
+
+03 → 发 33 44 55 66
+
+5.3 ESP32 从机侧
+
+SPI Slave 初始化成功
+
+串口日志应出现：
+
+RX from nRF: 11 22 33 44 等
+
+如果持续 timeout：优先检查 CS/供电/线序/是否共地
+
+6. 接线注意事项（必须写清楚，否则以后必踩坑）
+
+因为你是“从 SD 底座引脚飞线”，你无法打开设备，只能从外部测量。
+
+6.1 必须共地
+
+OpenEarable GND 与 ESP32 GND 必须连接，否则可能出现：
+
+ret=0 但读回随机
+
+ESP32 timeout
+
+波形测量误导
+
+6.2 供电域与电平
+
+SD 底座外侧电压来自 V_SD（由 LS_SD 控制）
+
+你已验证：当 LS_SD=1 时底座引脚电压在 3V 左右并可跳变
+
+若发现一直 0V：
+
+优先确认 LS_SD 是否被拉高
+
+确认 LS_3V3 总开关是否打开
+
+确认没有其他模块把它关掉（例如 SD logging 功能）
+
+6.3 CS 的“物理电平”原则
+
+你的主机逻辑：CS 物理拉低 = 选中
+
+如果用 dt 语义控制（gpio_pin_set_dt）可能会反相
+
+因此最终实现选择 gpio_pin_set_raw 保证物理一致性
+
+7. 常见问题与排障手册（将来你一定会用到）
+Q1：nRF 端 ret=0 但 rx=00 00 00 00，ESP32 端 timeout
+
+最常见原因顺序：
+
+CS 没真正被拉低（active_low 反相 / 接错脚）
+
+V_SD 没上电（LS_SD 未使能）
+
+MISO/MOSI 接反
+
+未共地
+
+Q2：拔下 ESP32 时 nRF 读到 FF，插上变成 00
+
+FF：MISO 线上拉/悬空高
+
+00：MISO 被外侧拉低或被钳位
+优先排查：供电域、电平转换、MISO 物理连接是否正确
+
+Q3：为什么 .c 文件 include esp32_link.hpp 会报错 cstddef？
+
+.c 用 C 编译器（-std=c99），不认识 C++ 标准头
+
+解决：GATT service 文件改为 .cpp 或提供 C 版 API 头
+
+8. 版本与环境信息（备份必须包含）
+
+OpenEarable 工程版本：2.2.x（你当前使用的分支/包）
+
+NCS：v3.0.1（日志中可见）
+
+Zephyr：v4.0.99-ncs1-1（日志中可见）
+
+构建工具：nRF Connect for VS Code + west + sysbuild
+
+调试输出：SEGGER RTT（J-Link V8.xx）
+
+9. 建议的备份方式（可选但强烈推荐）
+
+复制整个工程目录作为快照，例如：
+
+openearable_spi_blecmd_backup_YYYYMMDD/
+
+在根目录放置本文档：
+
+README_SPI_ESP32_BACKUP.md
+
+在文档顶部记录：
+
+接线照片/示意图
+
+你最终使用的 SPI 引脚来源（SD 底座哪几脚）
+
+你最终验证通过的 RTT 输出片段（10 行以内）
+
+10. 下一步可扩展方向（未来你要做时会用到）
+
+把 1/2/3 扩展为结构化命令（例如 opcode + payload）
+
+增加从 ESP32 回包的解析与状态上报（BLE Notify）
+
+把 SPI 命令与 OpenEarable 现有状态机挂钩（如按钮触发、传感器触发）
+
+加互斥与队列（多指令排队发送）
